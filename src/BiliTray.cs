@@ -98,8 +98,21 @@ static class Native {
 
 // 拦截"关闭"：点窗口右上角的叉、Alt+F4、Ctrl+W 都改成隐藏到托盘
 static class CloseHook {
-    public static IntPtr Target = IntPtr.Zero;
+    public static volatile IntPtr Target = IntPtr.Zero;
+    public static volatile uint BrowserPid = 0;    // Chrome 主进程；窗口还没被认出来时用它兜底
     public static volatile bool HiddenByClose = false;
+
+    // 刚启动时窗口可能还没被托盘程序认出来：只要是我们这个 Chrome 的窗口，就直接认领
+    static IntPtr Resolve(IntPtr root) {
+        IntPtr t = Target;
+        if (t != IntPtr.Zero || root == IntPtr.Zero || BrowserPid == 0) return t;
+        uint pid; Native.GetWindowThreadProcessId(root, out pid);
+        if (pid != BrowserPid) return IntPtr.Zero;
+        var sb = new StringBuilder(64); Native.GetClassName(root, sb, 64);
+        if (sb.ToString() != "Chrome_WidgetWin_1") return IntPtr.Zero;
+        Target = root;
+        return root;
+    }
     static Native.LLProc mProc, kProc;
     static uint threadId;
     static bool downSwallowed;
@@ -133,10 +146,11 @@ static class CloseHook {
     static void Hide() { Native.ShowWindowAsync(Target, 0); HiddenByClose = true; }
 
     static bool InCloseButton(Native.POINT p) {
-        IntPtr t = Target;
-        if (t == IntPtr.Zero) return false;
         IntPtr w = Native.WindowFromPoint(p);
-        if (w == IntPtr.Zero || Native.GetAncestor(w, 2) != t) return false;
+        if (w == IntPtr.Zero) return false;
+        IntPtr root = Native.GetAncestor(w, 2);
+        IntPtr t = Resolve(root);
+        if (t == IntPtr.Zero || root != t) return false;
         Native.RECT r; if (!Native.GetWindowRect(t, out r)) return false;
         double s = Native.GetDpiForWindow(t) / 96.0; if (s <= 0) s = 1;
         int right = r.r, top = r.t;
@@ -169,9 +183,10 @@ static class CloseHook {
     }
 
     static IntPtr KeyCb(int code, IntPtr w, IntPtr l) {
-        if (code >= 0 && Target != IntPtr.Zero) {
+        if (code >= 0) {
             int m = w.ToInt32();
-            if ((m == 0x100 || m == 0x104) && Native.GetForegroundWindow() == Target) {
+            IntPtr fg = (m == 0x100 || m == 0x104) ? Native.GetForegroundWindow() : IntPtr.Zero;
+            if (fg != IntPtr.Zero && Resolve(fg) == fg) {
                 var k = (Native.KBLL)Marshal.PtrToStructure(l, typeof(Native.KBLL));
                 bool alt = (k.flags & 0x20) != 0;
                 bool ctrl = Native.GetAsyncKeyState(0x11) < 0;
@@ -296,7 +311,8 @@ class TrayApp : ApplicationContext {
                 "--disable-background-networking",
                 "--disable-features=Translate,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,AutofillServerCommunication,InterestFeedContentSuggestions"
             });
-            Process.Start(new ProcessStartInfo(chrome, args) { UseShellExecute = false });
+            var proc = Process.Start(new ProcessStartInfo(chrome, args) { UseShellExecute = false });
+            if (proc != null) CloseHook.BrowserPid = (uint)proc.Id;   // 用独立配置目录启动时，这个就是 Chrome 主进程
         }
 
         tray = new NotifyIcon();
@@ -457,20 +473,27 @@ class TrayApp : ApplicationContext {
         while (running) {
             n++;
             try { WorkerTick(n); } catch { }
-            Thread.Sleep(300);
+            Thread.Sleep(hwnd == IntPtr.Zero ? 100 : 300);   // 还没找到窗口时查得勤一点
         }
     }
 
     void WorkerTick(int n) {
         IntPtr h = hwnd;
         if (h == IntPtr.Zero) {
-            if (n % 3 == 0) {
+            // 关闭钩子可能已经先认领了窗口
+            h = CloseHook.Target;
+            // 快速路径：已知 Chrome 主进程号，直接枚举窗口（不用查进程列表）
+            if (h == IntPtr.Zero && CloseHook.BrowserPid != 0)
+                h = Native.FindChromeWindow(new HashSet<uint> { CloseHook.BrowserPid });
+            // 兜底：查进程列表（比较慢，隔一会儿查一次）
+            if (h == IntPtr.Zero && n % 10 == 0) {
                 var pids = GetOurPids();
                 if (pids.Count > 0) {
                     h = Native.FindChromeWindow(pids);
-                    if (h != IntPtr.Zero) { CloseHook.Target = h; hwnd = h; }
+                    if (h != IntPtr.Zero) { uint pid; Native.GetWindowThreadProcessId(h, out pid); CloseHook.BrowserPid = pid; }
                 }
             }
+            if (h != IntPtr.Zero) { CloseHook.Target = h; hwnd = h; }
             return;
         }
         WatchTabs(n);
