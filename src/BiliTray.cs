@@ -239,16 +239,17 @@ class TrayApp : ApplicationContext {
     }
 
     readonly string profileDir, settingsFile;
-    bool powerSave = true;
-    bool lowMem = false;   // 低内存模式：关闭显卡加速，内存约减半，但窗口打开时 CPU 占用高很多
+    volatile bool powerSave = true;
+    bool lowMem = false;  // 低内存模式：关闭显卡加速，内存约减半，但窗口打开时 CPU 占用高很多
 
     void SaveSettings() {
         try { File.WriteAllText(settingsFile, "power=" + (powerSave ? "1" : "0") + "\r\nlowmem=" + (lowMem ? "1" : "0") + "\r\n"); } catch { }
     }
-    bool powerDirty = true;
+    volatile bool powerDirty = true;
+    volatile bool running = true;
     readonly NotifyIcon tray;
     readonly System.Windows.Forms.Timer timer;
-    IntPtr hwnd = IntPtr.Zero;
+    volatile IntPtr hwnd = IntPtr.Zero;   // 后台线程找到窗口后写入
     bool tipShown;
     int ticks, hiddenTicks;
     string mainId, mainWs, lastUrl;
@@ -336,6 +337,11 @@ class TrayApp : ApplicationContext {
 
         CloseHook.Start();
 
+        // 慢的事情（查进程、和 Chrome 通信、清内存）全部放后台线程，界面线程只做轻量操作，托盘菜单不会卡
+        var worker = new Thread(WorkerLoop);
+        worker.IsBackground = true;
+        worker.Start();
+
         timer = new System.Windows.Forms.Timer();
         timer.Interval = 300;
         timer.Tick += delegate { OnTick(); };
@@ -397,14 +403,17 @@ class TrayApp : ApplicationContext {
         tipShown = true;
         tray.ShowBalloonTip(2500, "BiliTray", "已缩到托盘，音乐继续播放。单击图标打开窗口，右键可以退出。", ToolTipIcon.Info);
     }
+    // 用 ShowWindowAsync：Chrome 忙的时候也不会把托盘程序卡住
     void ShowPlayer() {
-        if (hwnd == IntPtr.Zero) return;
-        Native.ShowWindow(hwnd, 9);
-        Native.SetForegroundWindow(hwnd);
+        IntPtr h = hwnd;
+        if (h == IntPtr.Zero) return;
+        Native.ShowWindowAsync(h, 9);
+        Native.SetForegroundWindow(h);
     }
     void HidePlayer() {
-        if (hwnd == IntPtr.Zero) return;
-        Native.ShowWindow(hwnd, 0);
+        IntPtr h = hwnd;
+        if (h == IntPtr.Zero) return;
+        Native.ShowWindowAsync(h, 0);
         ShowHiddenTip();
     }
     void TogglePlayer() {
@@ -412,6 +421,7 @@ class TrayApp : ApplicationContext {
         if (Native.IsWindowVisible(hwnd) && !Native.IsIconic(hwnd)) HidePlayer(); else ShowPlayer();
     }
     void QuitAll() {
+        running = false;
         timer.Stop();
         CloseHook.Stop();
         // 发 WM_CLOSE 让 Chrome 正常退出，登录状态等数据会先保存好
@@ -421,31 +431,53 @@ class TrayApp : ApplicationContext {
         ExitThread();
     }
 
+    // 界面线程：只做很快的窗口状态检查
     void OnTick() {
         ticks++;
-        if (hwnd == IntPtr.Zero) {
-            if (ticks % 3 == 0) {
-                var pids = GetOurPids();
-                if (pids.Count > 0) { hwnd = Native.FindChromeWindow(pids); CloseHook.Target = hwnd; }
-            }
-            if (ticks > 200 && hwnd == IntPtr.Zero) QuitAll();   // 约 60 秒还没窗口就放弃
+        IntPtr h = hwnd;
+        if (h == IntPtr.Zero) {
+            if (ticks > 200) QuitAll();   // 约 60 秒还没窗口就放弃
             return;
         }
-        if (!Native.IsWindow(hwnd)) { QuitAll(); return; }       // 窗口真的没了 = 一起退出
+        if (!Native.IsWindow(h)) { QuitAll(); return; }       // 窗口真的没了 = 一起退出
         if (CloseHook.HiddenByClose) { CloseHook.HiddenByClose = false; ShowHiddenTip(); }
-        if (Native.IsIconic(hwnd) && Native.IsWindowVisible(hwnd)) HidePlayer();
-        WatchTabs();
-
-        // 窗口藏起来后：3 秒后清一次内存，之后每 30 秒清一次
-        if (Native.IsWindowVisible(hwnd)) hiddenTicks = 0;
-        else if (++hiddenTicks == 10 || hiddenTicks % 100 == 0) TrimMemory();
+        if (Native.IsIconic(h) && Native.IsWindowVisible(h)) HidePlayer();
         if (ticks % 5 == 0) {
-            string t = Native.Title(hwnd);
+            string t = Native.Title(h);
             if (t.EndsWith("_哔哩哔哩_bilibili")) t = t.Substring(0, t.Length - "_哔哩哔哩_bilibili".Length);
             if (t.Length == 0) t = "BiliTray";
             if (t.Length > 60) t = t.Substring(0, 60) + "…";
             tray.Text = t;
         }
+    }
+
+    // 后台线程：找窗口、管标签页、注入脚本、清内存
+    void WorkerLoop() {
+        int n = 0;
+        while (running) {
+            n++;
+            try { WorkerTick(n); } catch { }
+            Thread.Sleep(300);
+        }
+    }
+
+    void WorkerTick(int n) {
+        IntPtr h = hwnd;
+        if (h == IntPtr.Zero) {
+            if (n % 3 == 0) {
+                var pids = GetOurPids();
+                if (pids.Count > 0) {
+                    h = Native.FindChromeWindow(pids);
+                    if (h != IntPtr.Zero) { CloseHook.Target = h; hwnd = h; }
+                }
+            }
+            return;
+        }
+        WatchTabs(n);
+
+        // 窗口藏起来后：3 秒后清一次内存，之后每 30 秒清一次
+        if (Native.IsWindowVisible(h)) hiddenTicks = 0;
+        else if (++hiddenTicks == 10 || hiddenTicks % 100 == 0) TrimMemory();
     }
 
     void TrimMemory() {
@@ -457,7 +489,7 @@ class TrayApp : ApplicationContext {
     }
 
     // 有新标签页冒出来：把网址拿回播放窗口打开，再关掉它
-    void WatchTabs() {
+    void WatchTabs(int ticks) {
         string raw = Cdp.Get(CdpBase + "/json/list");
         if (raw == null) return;
         var pages = new List<Dictionary<string, object>>();
