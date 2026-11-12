@@ -34,7 +34,7 @@ $bw.Close()
 
 $fw  = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319"
 & "$fw\csc.exe" /nologo /target:winexe /optimize+ /platform:anycpu /codepage:65001 `
-    "/out:$out\BiliTray.exe" "/win32icon:$ico" `
+    "/out:$out\BiliTray.exe" "/win32icon:$ico" "/resource:$root\src\power.js,power.js" `
     /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll /r:System.Web.Extensions.dll `
     "$root\src\BiliTray.cs"
 if ($LASTEXITCODE -ne 0) { throw "编译失败" }

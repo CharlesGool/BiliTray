@@ -210,7 +210,16 @@ class TrayApp : ApplicationContext {
   };
 })();";
 
-    readonly string profileDir;
+    // 省电模式脚本（src/power.js，编译时嵌入 exe）：480P、关弹幕、关页面动画
+    static readonly string PowerJs = LoadResource("power.js");
+    static string LoadResource(string name) {
+        using (var s = typeof(TrayApp).Assembly.GetManifestResourceStream(name))
+        using (var r = new StreamReader(s, Encoding.UTF8)) return r.ReadToEnd();
+    }
+
+    readonly string profileDir, settingsFile;
+    bool powerSave = true;
+    bool powerDirty = true;
     readonly NotifyIcon tray;
     readonly System.Windows.Forms.Timer timer;
     IntPtr hwnd = IntPtr.Zero;
@@ -222,6 +231,8 @@ class TrayApp : ApplicationContext {
     public TrayApp(string url) {
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
         profileDir = Path.Combine(baseDir, @"Data\ChromeProfile");
+        settingsFile = Path.Combine(baseDir, @"Data\settings.ini");
+        try { if (File.Exists(settingsFile) && File.ReadAllText(settingsFile).Contains("power=0")) powerSave = false; } catch { }
 
         string chrome = FindChrome();
         if (chrome == null) {
@@ -269,6 +280,14 @@ class TrayApp : ApplicationContext {
         menu.Items.Add("下一首").Click += delegate { Native.Key(0xB0); };
         menu.Items.Add("上一首").Click += delegate { Native.Key(0xB1); };
         menu.Items.Add(new ToolStripSeparator());
+        var miPower = new ToolStripMenuItem("省电模式（480P / 关弹幕 / 关动画）");
+        miPower.CheckOnClick = true;
+        miPower.Checked = powerSave;
+        miPower.CheckedChanged += delegate {
+            powerSave = miPower.Checked; powerDirty = true;
+            try { File.WriteAllText(settingsFile, "power=" + (powerSave ? "1" : "0")); } catch { }
+        };
+        menu.Items.Add(miPower);
         menu.Items.Add("打开数据文件夹").Click += delegate { Process.Start("explorer.exe", "\"" + profileDir + "\""); };
         menu.Items.Add("退出").Click += delegate { QuitAll(); };
         tray.ContextMenuStrip = menu;
@@ -430,10 +449,13 @@ class TrayApp : ApplicationContext {
         }
 
         string mainUrl = Str(main, "url");
-        if (mainUrl != lastUrl || ticks % 15 == 0) {
+        if (mainUrl != lastUrl || ticks % 15 == 0 || powerDirty) {
             lastUrl = mainUrl;
+            powerDirty = false;
             var prm = new Dictionary<string, object>(); prm["expression"] = SameWindowJs;
             Cdp.Call(mainWs, "Runtime.evaluate", prm);
+            var prm2 = new Dictionary<string, object>(); prm2["expression"] = PowerJs.Replace("__ON__", powerSave ? "true" : "false");
+            Cdp.Call(mainWs, "Runtime.evaluate", prm2);
         }
     }
 
