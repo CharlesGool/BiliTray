@@ -61,6 +61,17 @@ static class Native {
     [DllImport("user32.dll")] public static extern int GetMessage(out MSG m, IntPtr h, uint a, uint b);
     [DllImport("user32.dll")] public static extern bool PostThreadMessage(uint tid, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
+    [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr h);
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+
+    // 把进程暂时用不到的内存交还给系统（需要时会自动换回来）
+    public static void TrimProcess(uint pid) {
+        IntPtr h = OpenProcess(0x0400 | 0x0100, false, pid);   // QUERY_INFORMATION | SET_QUOTA
+        if (h == IntPtr.Zero) return;
+        EmptyWorkingSet(h);
+        CloseHandle(h);
+    }
 
     public static void Key(byte vk) {
         keybd_event(vk, 0, 0, UIntPtr.Zero); keybd_event(vk, 0, 2, UIntPtr.Zero);
@@ -204,7 +215,7 @@ class TrayApp : ApplicationContext {
     readonly System.Windows.Forms.Timer timer;
     IntPtr hwnd = IntPtr.Zero;
     bool tipShown;
-    int ticks;
+    int ticks, hiddenTicks;
     string mainId, mainWs, lastUrl;
     readonly Dictionary<string, int> blankSeen = new Dictionary<string, int>();
 
@@ -232,7 +243,14 @@ class TrayApp : ApplicationContext {
                 // 窗口隐藏后也别降速，保证连播/自动下一首正常
                 "--disable-background-timer-throttling",
                 "--disable-renderer-backgrounding",
-                "--disable-backgrounding-occluded-windows"
+                "--disable-backgrounding-occluded-windows",
+                // 关掉听歌用不上的后台功能，省内存
+                "--disable-extensions",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-background-networking",
+                "--disable-features=Translate,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,AutofillServerCommunication,InterestFeedContentSuggestions"
             });
             Process.Start(new ProcessStartInfo(chrome, args) { UseShellExecute = false });
         }
@@ -357,6 +375,10 @@ class TrayApp : ApplicationContext {
         if (CloseHook.HiddenByClose) { CloseHook.HiddenByClose = false; ShowHiddenTip(); }
         if (Native.IsIconic(hwnd) && Native.IsWindowVisible(hwnd)) HidePlayer();
         WatchTabs();
+
+        // 窗口藏起来后：3 秒后清一次内存，之后每 2 分钟清一次
+        if (Native.IsWindowVisible(hwnd)) hiddenTicks = 0;
+        else if (++hiddenTicks == 10 || hiddenTicks % 400 == 0) TrimMemory();
         if (ticks % 5 == 0) {
             string t = Native.Title(hwnd);
             if (t.EndsWith("_哔哩哔哩_bilibili")) t = t.Substring(0, t.Length - "_哔哩哔哩_bilibili".Length);
@@ -364,6 +386,14 @@ class TrayApp : ApplicationContext {
             if (t.Length > 60) t = t.Substring(0, 60) + "…";
             tray.Text = t;
         }
+    }
+
+    void TrimMemory() {
+        if (mainWs != null) {
+            var prm = new Dictionary<string, object>(); prm["level"] = "critical";
+            Cdp.Call(mainWs, "Memory.simulatePressureNotification", prm);   // 让 Chrome 自己先丢掉缓存
+        }
+        foreach (uint pid in GetOurPids()) Native.TrimProcess(pid);
     }
 
     // 有新标签页冒出来：把网址拿回播放窗口打开，再关掉它
@@ -418,6 +448,8 @@ static class Program {
         bool created;
         using (var mutex = new Mutex(true, "Local\\BiliTrayMusicPlayer", out created)) {
             if (!created) return;
+            // 更新时正在运行的旧 exe 会被改名成 BiliTray.old.exe，这里顺手删掉
+            try { File.Delete(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BiliTray.old.exe")); } catch { }
             try { Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
