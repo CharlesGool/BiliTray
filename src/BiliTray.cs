@@ -240,6 +240,11 @@ class TrayApp : ApplicationContext {
 
     readonly string profileDir, settingsFile;
     bool powerSave = true;
+    bool lowMem = false;   // 低内存模式：关闭显卡加速，内存约减半，但窗口打开时 CPU 占用高很多
+
+    void SaveSettings() {
+        try { File.WriteAllText(settingsFile, "power=" + (powerSave ? "1" : "0") + "\r\nlowmem=" + (lowMem ? "1" : "0") + "\r\n"); } catch { }
+    }
     bool powerDirty = true;
     readonly NotifyIcon tray;
     readonly System.Windows.Forms.Timer timer;
@@ -253,7 +258,13 @@ class TrayApp : ApplicationContext {
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
         profileDir = Path.Combine(baseDir, @"Data\ChromeProfile");
         settingsFile = Path.Combine(baseDir, @"Data\settings.ini");
-        try { if (File.Exists(settingsFile) && File.ReadAllText(settingsFile).Contains("power=0")) powerSave = false; } catch { }
+        try {
+            if (File.Exists(settingsFile)) {
+                string ini = File.ReadAllText(settingsFile);
+                if (ini.Contains("power=0")) powerSave = false;
+                if (ini.Contains("lowmem=1")) lowMem = true;
+            }
+        } catch { }
 
         string chrome = FindChrome();
         if (chrome == null) {
@@ -263,7 +274,7 @@ class TrayApp : ApplicationContext {
         Directory.CreateDirectory(profileDir);
 
         if (GetOurPids().Count == 0) {
-            string args = string.Join(" ", new[] {
+            string args = (lowMem ? "--disable-gpu " : "") + string.Join(" ", new[] {
                 "--app=\"" + url + "\"",
                 "--user-data-dir=\"" + profileDir + "\"",
                 "--remote-debugging-port=" + CdpPort,
@@ -306,9 +317,18 @@ class TrayApp : ApplicationContext {
         miPower.Checked = powerSave;
         miPower.CheckedChanged += delegate {
             powerSave = miPower.Checked; powerDirty = true;
-            try { File.WriteAllText(settingsFile, "power=" + (powerSave ? "1" : "0")); } catch { }
+            SaveSettings();
         };
         menu.Items.Add(miPower);
+        var miLowMem = new ToolStripMenuItem("低内存模式（关显卡加速，内存约减半，窗口开着时更费 CPU）");
+        miLowMem.CheckOnClick = true;
+        miLowMem.Checked = lowMem;
+        miLowMem.CheckedChanged += delegate {
+            lowMem = miLowMem.Checked;
+            SaveSettings();
+            tray.ShowBalloonTip(3000, "BiliTray", "重新打开 BiliTray 后生效（右键「退出」再打开）。", ToolTipIcon.Info);
+        };
+        menu.Items.Add(miLowMem);
         menu.Items.Add("打开数据文件夹").Click += delegate { Process.Start("explorer.exe", "\"" + profileDir + "\""); };
         menu.Items.Add("退出").Click += delegate { QuitAll(); };
         tray.ContextMenuStrip = menu;
@@ -416,9 +436,9 @@ class TrayApp : ApplicationContext {
         if (Native.IsIconic(hwnd) && Native.IsWindowVisible(hwnd)) HidePlayer();
         WatchTabs();
 
-        // 窗口藏起来后：3 秒后清一次内存，之后每 2 分钟清一次
+        // 窗口藏起来后：3 秒后清一次内存，之后每 30 秒清一次
         if (Native.IsWindowVisible(hwnd)) hiddenTicks = 0;
-        else if (++hiddenTicks == 10 || hiddenTicks % 400 == 0) TrimMemory();
+        else if (++hiddenTicks == 10 || hiddenTicks % 100 == 0) TrimMemory();
         if (ticks % 5 == 0) {
             string t = Native.Title(hwnd);
             if (t.EndsWith("_哔哩哔哩_bilibili")) t = t.Substring(0, t.Length - "_哔哩哔哩_bilibili".Length);
