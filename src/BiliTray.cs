@@ -1,4 +1,4 @@
-// BiliTray - 可以缩到托盘的 B 站听歌小窗口（便携版）
+﻿// BiliTray - 可以缩到托盘的 B 站听歌小窗口（便携版）
 // 最小化 / 点叉 / Alt+F4 / Ctrl+W = 藏到托盘继续播放；单击托盘 = 显示/隐藏；右键托盘 = 菜单
 // 浏览器数据保存在 exe 同目录的 Data\ChromeProfile
 // 编译：见 build.ps1（用 Windows 自带的 .NET Framework csc.exe，C# 5 语法）
@@ -61,6 +61,10 @@ static class Native {
     [DllImport("user32.dll")] public static extern int GetMessage(out MSG m, IntPtr h, uint a, uint b);
     [DllImport("user32.dll")] public static extern bool PostThreadMessage(uint tid, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
+    [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+    [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr m, ref MONITORINFO mi);
+    [DllImport("user32.dll")] public static extern UIntPtr SetTimer(IntPtr h, UIntPtr id, uint ms, IntPtr fn);
     [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr h);
     [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
@@ -108,8 +112,17 @@ static class CloseHook {
             IntPtr mod = Native.GetModuleHandle(null);
             IntPtr mh = Native.SetWindowsHookEx(14, mProc, mod, 0);   // WH_MOUSE_LL
             IntPtr kh = Native.SetWindowsHookEx(13, kProc, mod, 0);   // WH_KEYBOARD_LL
+            // Windows 在系统卡顿时可能悄悄移除钩子，所以每 30 秒重新装一次
+            Native.SetTimer(IntPtr.Zero, UIntPtr.Zero, 30000, IntPtr.Zero);
             Native.MSG msg;
-            while (Native.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { }
+            while (Native.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
+                if (msg.m == 0x113) {   // WM_TIMER
+                    IntPtr nm = Native.SetWindowsHookEx(14, mProc, mod, 0);
+                    IntPtr nk = Native.SetWindowsHookEx(13, kProc, mod, 0);
+                    if (nm != IntPtr.Zero) { Native.UnhookWindowsHookEx(mh); mh = nm; }
+                    if (nk != IntPtr.Zero) { Native.UnhookWindowsHookEx(kh); kh = nk; }
+                }
+            }
             Native.UnhookWindowsHookEx(mh); Native.UnhookWindowsHookEx(kh);
         });
         th.IsBackground = true;
@@ -126,9 +139,17 @@ static class CloseHook {
         if (w == IntPtr.Zero || Native.GetAncestor(w, 2) != t) return false;
         Native.RECT r; if (!Native.GetWindowRect(t, out r)) return false;
         double s = Native.GetDpiForWindow(t) / 96.0; if (s <= 0) s = 1;
-        int inset = Native.IsZoomed(t) ? (int)(8 * s) : 0;          // 最大化时窗口边框伸出屏幕外
-        int right = r.r - inset, top = r.t + inset;
-        return p.x >= right - (int)(48 * s) && p.x < right && p.y >= top && p.y < top + (int)(34 * s);
+        int right = r.r, top = r.t;
+        if (Native.IsZoomed(t)) {
+            // 最大化时窗口边框伸出屏幕外：以屏幕可见边缘为准，
+            // 并且把伸出去的那一圈也算进来（鼠标甩到右上角的点击就落在这里）
+            var mi = new Native.MONITORINFO(); mi.cbSize = Marshal.SizeOf(typeof(Native.MONITORINFO));
+            if (Native.GetMonitorInfo(Native.MonitorFromWindow(t, 2), ref mi)) {
+                right = Math.Min(r.r, mi.rcWork.r);
+                top = Math.Max(r.t, mi.rcWork.t);
+            }
+        }
+        return p.x >= right - (int)(46 * s) && p.x < r.r && p.y >= r.t && p.y < top + (int)(34 * s);
     }
 
     static IntPtr MouseCb(int code, IntPtr w, IntPtr l) {
